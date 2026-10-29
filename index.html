@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Whisper Web Transcriber</title>
+    <meta name="description" content="Transcribe audio and video files with Whisper inside your browser. The file is not uploaded.">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="base.css">
+    <link rel="stylesheet" href="src/tool.css">
+</head>
+<body>
+    <main>
+    <section class="wo-hero">
+        <div class="container">
+            <h1>Whisper in your browser, without uploading your file</h1>
+            <p class="wo-lead">Pick an audio or video file and OpenAI's Whisper turns it into text inside this browser tab, on your own computer. Nothing gets uploaded.</p>
+
+            <div class="wo-tool">
+                <div class="wo-options">
+                    <div class="wo-field">
+                        <label for="wo-model">Model (downloads once, then cached)</label>
+                        <select id="wo-model">
+                            <option value="tiny" data-label="Tiny, fastest">Tiny, fastest</option>
+                            <option value="base" data-label="Base, balanced" selected>Base, balanced</option>
+                            <option value="small" data-label="Small, most accurate">Small, most accurate</option>
+                        </select>
+                    </div>
+                    <div class="wo-field">
+                        <label for="wo-language">Spoken language</label>
+                        <select id="wo-language">
+                            <option value="auto" selected>Detect automatically</option>
+                            <option value="en">English</option>
+                            <option value="es">Spanish</option>
+                            <option value="fr">French</option>
+                            <option value="de">German</option>
+                            <option value="it">Italian</option>
+                            <option value="pt">Portuguese</option>
+                            <option value="nl">Dutch</option>
+                            <option value="pl">Polish</option>
+                            <option value="ru">Russian</option>
+                            <option value="uk">Ukrainian</option>
+                            <option value="tr">Turkish</option>
+                            <option value="ar">Arabic</option>
+                            <option value="he">Hebrew</option>
+                            <option value="hi">Hindi</option>
+                            <option value="ja">Japanese</option>
+                            <option value="ko">Korean</option>
+                            <option value="zh">Chinese</option>
+                            <option value="vi">Vietnamese</option>
+                            <option value="th">Thai</option>
+                            <option value="id">Indonesian</option>
+                            <option value="sv">Swedish</option>
+                            <option value="da">Danish</option>
+                            <option value="no">Norwegian</option>
+                            <option value="fi">Finnish</option>
+                            <option value="cs">Czech</option>
+                            <option value="el">Greek</option>
+                            <option value="ro">Romanian</option>
+                            <option value="hu">Hungarian</option>
+                        </select>
+                    </div>
+                    <label class="wo-check"><input type="checkbox" id="wo-translate"> Translate the result into English</label>
+                </div>
+
+                <label class="wo-drop" id="wo-drop">
+                    <input type="file" id="wo-file" accept="audio/*,video/*,.mp3,.wav,.m4a,.aac,.ogg,.opus,.flac,.webm,.mp4,.mov">
+                    <strong>Choose a file or drop it here</strong>
+                    <span>MP3, WAV, M4A, OGG, FLAC, WEBM, MP4 and other formats your browser can play</span>
+                </label>
+                <p class="wo-device" id="wo-device">Checking what your browser supports...</p>
+
+                <div class="wo-result" id="wo-result" data-state="idle" aria-live="polite">
+                    <p class="wo-status" id="wo-status"></p>
+                    <div class="wo-track"><div class="wo-bar" id="wo-bar"></div></div>
+                    <textarea class="wo-text" id="wo-text" aria-label="Transcript" spellcheck="false" placeholder="The transcript appears here."></textarea>
+                    <div class="wo-row">
+                        <label class="wo-done-only"><input type="checkbox" id="wo-stamps"> Show timestamps</label>
+                        <button type="button" class="wo-btn wo-btn-primary wo-done-only" id="wo-copy">Copy text</button>
+                        <button type="button" class="wo-btn wo-done-only" data-wo-download="txt">TXT</button>
+                        <button type="button" class="wo-btn wo-done-only" data-wo-download="srt">SRT</button>
+                        <button type="button" class="wo-btn wo-done-only" data-wo-download="vtt">VTT</button>
+                        <button type="button" class="wo-btn wo-cancel" id="wo-cancel">Cancel</button>
+                        <button type="button" class="wo-btn" id="wo-again">New file</button>
+                    </div>
+                    <div class="wo-cta" id="wo-cta" hidden>
+                        <p><strong>Rather talk than type?</strong> StarWhisper puts the same Whisper in every text box on your PC or Mac. Press a hotkey, speak, and the words appear in your email, doc or chat. Free for 2,000 words a week, no account needed.</p>
+                        <a class="wo-btn wo-btn-primary" href="https://starwhisper.ai/#download" data-cta="download">Try it free</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+    </main>
+    <p class="wo-foot">Open source under the MIT license. Models run through transformers.js and are downloaded from the Hugging Face hub the first time you use them.</p>
+    <script type="module" src="src/app.js"></script>
+</body>
+</html>
