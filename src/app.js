@@ -19,6 +19,8 @@ const S = {
   decodeFail: 'Your browser could not read the audio in this file. Try MP3, WAV, M4A or MP4, or convert it first.',
   codecFail: "This file uses an audio format ({codec}) your browser can't decode. Convert it to MP3 or WAV first.",
   noAudio: 'This file has no audio track we could read.',
+  noSpeech: 'No speech found in this file.',
+  libFail: "Couldn't download the file reader from cdn.jsdelivr.net. Check your connection. Some company and school networks block it.",
   longCpu: 'This recording is {min} minutes long and your browser is using the processor, so it will take a while. Keep this tab open.',
   loading: 'Loading Whisper...',
   detecting: 'Detecting the language...',
@@ -40,6 +42,8 @@ const LANG_NAMES = new Intl.DisplayNames([document.documentElement.lang || 'en']
 const FORCED = new URLSearchParams(location.search).get('device'); // 'wasm' or 'webgpu', for testing
 const MOBILE = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 const MAX_BYTES = MOBILE ? 200e6 : 1e9; // above this, reading the whole file into memory is not safe
+// A 58 MB, 1 hour MP3 peaked at 2.9 GB decoded whole and 525 MB read in pieces, so above this size pieces come first.
+const PIECES_ABOVE = 50e6;
 const STREAM_LIB = 'https://cdn.jsdelivr.net/npm/mediabunny@1.61.6/+esm'; // needs WebCodecs, loaded only when decodeStreaming runs
 const CAN_STREAM = typeof AudioDecoder !== 'undefined';
 const PREFER = window.WO_STRINGS ? document.documentElement.lang.slice(0, 2) : null;
@@ -49,10 +53,14 @@ let run = null; // { name, seconds, started, chunks, text, language, device }
 
 const track = (name, params) => { try { window.gtag?.('event', name, params); } catch (e) { /* analytics is optional */ } };
 const bucket = (min) => (min < 1 ? '<1' : min < 5 ? '1-5' : min < 15 ? '5-15' : min < 60 ? '15-60' : '60+');
-// Optional cookieless count of finished runs (<meta name="wo-ping" content="/path/ping.gif">), read from the
-// web server log: model, device, length bucket. Never the file or the text.
+const sizeBucket = (bytes) => (bytes < 50e6 ? 'under-50' : bytes < 200e6 ? '50-200' : bytes < 1e9 ? '200-1000' : 'over-1000');
+// Optional cookieless counts (<meta name="wo-ping" content="/path/ping.gif">), read from the web server log:
+// size bucket and reader at the start, model, device, length bucket and speed at the end, the failed step on an error.
+// Never the file or the text.
 const PING = document.querySelector('meta[name="wo-ping"]')?.content;
 const ping = (e, p) => { if (PING) new Image().src = `${PING}?${new URLSearchParams({ e, ...p, r: Math.random().toString(36).slice(2) })}`; };
+
+const readError = (messageKey, stage = 'decode', codec = '') => Object.assign(new Error(messageKey), { messageKey, stage, codec });
 
 function setState(state, message) {
   els.result.dataset.state = state;
@@ -79,7 +87,7 @@ async function detectGPU() {
 
 function getWorker() {
   if (!worker) {
-    worker = new Worker(new URL('./worker.js?v=6', import.meta.url), { type: 'module' });
+    worker = new Worker(new URL('./worker.js?v=7', import.meta.url), { type: 'module' });
     worker.onmessage = onWorkerMessage;
     worker.onerror = (e) => fail('engine', e.message || t('engineFail'));
   }
@@ -89,12 +97,16 @@ function getWorker() {
 // An OfflineAudioContext at 16 kHz decodes and resamples in one step, needs no audio device
 // and keeps memory at 16 kHz instead of the file's own rate.
 async function decode(file) {
-  const buf = await file.arrayBuffer();
-  let ctx;
-  try { ctx = new OfflineAudioContext(1, 1, 16000); } catch (e) { ctx = null; }
-  const audio = await (ctx || new OfflineAudioContext(1, 1, 44100)).decodeAudioData(buf);
-  const mono = mixDown(audio);
-  return audio.sampleRate === 16000 ? mono : resample(mono, audio.sampleRate);
+  try {
+    const buf = await file.arrayBuffer();
+    let ctx;
+    try { ctx = new OfflineAudioContext(1, 1, 16000); } catch (e) { ctx = null; }
+    const audio = await (ctx || new OfflineAudioContext(1, 1, 44100)).decodeAudioData(buf);
+    const mono = mixDown(audio);
+    return audio.sampleRate === 16000 ? mono : resample(mono, audio.sampleRate);
+  } catch (e) {
+    throw e instanceof RangeError ? readError('memoryFail', 'memory') : e;
+  }
 }
 
 // Copies, so the samples can be transferred to the worker (AudioBuffer memory is not transferable).
@@ -120,10 +132,27 @@ function resample(input, rate) {
   return out;
 }
 
+// Butterworth low-pass in place, three biquads in a row. The rate change below has no filter of its own,
+// so without this anything above 8 kHz folds back over the speech.
+function lowPass(block, rate) {
+  const w = 2 * Math.PI * 7200 / rate, cos = Math.cos(w), sin = Math.sin(w);
+  for (const q of [0.5176, 0.7071, 1.9319]) {
+    const alpha = sin / (2 * q), a0 = 1 + alpha;
+    const b1 = (1 - cos) / a0, b0 = b1 / 2, a1 = -2 * cos / a0, a2 = (1 - alpha) / a0;
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let i = 0; i < block.length; i++) {
+      const x = block[i], y = b0 * x + b1 * x1 + b0 * x2 - a1 * y1 - a2 * y2;
+      x2 = x1; x1 = x; y2 = y1; y1 = y;
+      block[i] = y;
+    }
+  }
+}
+
 // One block of mono samples to 16 kHz, with the browser's own resampler.
 async function blockTo16k(block, rate) {
   if (rate === 16000) return block;
-  const ctx = new OfflineAudioContext(1, Math.round(block.length * 16000 / rate), 16000);
+  if (rate > 16000) lowPass(block, rate);
+  const ctx = new OfflineAudioContext(1, Math.max(1, Math.round(block.length * 16000 / rate)), 16000);
   const buffer = ctx.createBuffer(1, block.length, rate);
   buffer.copyToChannel(block, 0);
   const source = ctx.createBufferSource();
@@ -136,13 +165,16 @@ async function blockTo16k(block, rate) {
 // For files too big to read into memory or that decodeAudioData refuses: reads only the audio track,
 // piece by piece, with WebCodecs. The file stays on this device. Returns null if the run was cancelled.
 async function decodeStreaming(file, isCurrent) {
-  const { Input, BlobSource, ALL_FORMATS, AudioSampleSink } = await import(STREAM_LIB);
+  const { Input, BlobSource, ALL_FORMATS, AudioSampleSink } = await import(STREAM_LIB).catch(() => { throw readError('libFail', 'lib'); });
   const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
   const track = await input.getPrimaryAudioTrack();
-  if (!track) throw Object.assign(new Error('no audio track'), { messageKey: 'noAudio' });
-  if (!(await track.canDecode())) throw Object.assign(new Error('codec'), { messageKey: 'codecFail', codec: track.codec || '?' });
-  const duration = await track.computeDuration();
-  let out = new Float32Array(Math.ceil(duration * 16000) + 16000); // a RangeError here means not enough memory
+  if (!track) throw readError('noAudio');
+  if (!(await track.canDecode())) throw readError('codecFail', 'decode', track.codec || '?');
+  // Timestamps can start far from zero, and the duration is where the last one ends.
+  const first = await track.getFirstTimestamp();
+  const duration = (await track.computeDuration()) - first;
+  const samples = (n) => { try { return new Float32Array(n); } catch (e) { throw readError('memoryFail', 'memory'); } };
+  let out = samples(Math.ceil(Math.max(0, duration) * 16000) + 16000);
   let written = 0;
   let block = null; // 30 s of mono samples at the decoded rate
   let filled = 0;
@@ -150,14 +182,14 @@ async function decodeStreaming(file, isCurrent) {
   const flush = async () => {
     if (!filled) return;
     const part = await blockTo16k(block.subarray(0, filled), rate);
-    if (written + part.length > out.length) { const grown = new Float32Array(written + part.length + 16000 * 60); grown.set(out.subarray(0, written)); out = grown; }
+    if (written + part.length > out.length) { const grown = samples(written + part.length + 16000 * 60); grown.set(out.subarray(0, written)); out = grown; }
     out.set(part, written);
     written += part.length;
     filled = 0;
   };
   for await (const sample of new AudioSampleSink(track).samples()) {
     if (!isCurrent()) { sample.close(); return null; }
-    if (!block) { rate = sample.sampleRate; block = new Float32Array(rate * 30); }
+    if (sample.sampleRate !== rate) { await flush(); rate = sample.sampleRate; block = new Float32Array(rate * 30); }
     const frames = sample.numberOfFrames, channels = sample.numberOfChannels;
     const mono = new Float32Array(frames);
     const plane = new Float32Array(frames);
@@ -165,7 +197,7 @@ async function decodeStreaming(file, isCurrent) {
       sample.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
       for (let i = 0; i < frames; i++) mono[i] += plane[i] / channels;
     }
-    const seconds = sample.timestamp;
+    const seconds = sample.timestamp - first;
     sample.close();
     for (let at = 0; at < frames;) {
       const take = Math.min(frames - at, block.length - filled);
@@ -180,6 +212,21 @@ async function decodeStreaming(file, isCurrent) {
   return out.subarray(0, written);
 }
 
+// The first reader that works. Whole decoding after a memory failure in pieces would only fail harder.
+async function readAudio(readers, file, isCurrent) {
+  const [first, second] = readers;
+  try {
+    return await first(file, isCurrent);
+  } catch (e) {
+    if (!second || !isCurrent() || (e.messageKey === 'memoryFail' && second === decode)) throw e;
+    try {
+      return await second(file, isCurrent);
+    } catch (e2) {
+      throw e.messageKey ? e : e2;
+    }
+  }
+}
+
 async function start(file) {
   if (!file || els.result.dataset.state === 'working') return;
   const current = { name: file.name.replace(/\.[^.]+$/, '') || 'transcript', started: performance.now(), text: '' };
@@ -189,27 +236,23 @@ async function start(file) {
   els.text.readOnly = true;
   els.cta.hidden = true;
   setProgress(0);
+  setState('working', t('reading'));
+  // The piece reader hangs the tab on a damaged FLAC, so FLAC is only ever decoded whole.
+  const pieces = CAN_STREAM && (await file.slice(0, 4).text().catch(() => '')) !== 'fLaC';
+  if (!isCurrent()) return;
   const big = file.size > MAX_BYTES;
-  if (big && !CAN_STREAM) {
+  if (big && !pieces) {
     return fail('size', t(MOBILE ? 'tooBigPhone' : 'tooBig', { mb: Math.round(file.size / 1e6) }));
   }
-  setState('working', t('reading'));
+  const readers = !pieces ? [decode] : big ? [decodeStreaming] : file.size > PIECES_ABOVE ? [decodeStreaming, decode] : [decode, decodeStreaming];
+  // Before reading, so a tab that dies on the file still leaves a trace.
+  ping('start', { mb: sizeBucket(file.size), via: readers[0] === decode ? 'whole' : 'pieces' });
   let audio;
   try {
-    if (big) {
-      audio = await decodeStreaming(file, isCurrent);
-    } else {
-      try {
-        audio = await decode(file);
-      } catch (e) {
-        if (!CAN_STREAM) throw e;
-        audio = await decodeStreaming(file, isCurrent);
-      }
-    }
+    audio = await readAudio(readers, file, isCurrent);
   } catch (e) {
     if (!isCurrent()) return;
-    if (e instanceof RangeError) return fail('memory', t('memoryFail'));
-    return fail('decode', e.messageKey ? t(e.messageKey, { codec: e.codec }) : t('decodeFail'));
+    return fail(e.stage || 'decode', t(e.messageKey || 'decodeFail', { codec: e.codec }));
   }
   if (!isCurrent() || !audio) return;
   setProgress(0);
@@ -235,7 +278,7 @@ function onWorkerMessage({ data }) {
       if (data.stage === 'detecting') setState('working', t('detecting'));
       if (data.stage === 'transcribing') {
         setState('working', t('part', { n: Math.min(data.done + 1, data.total), total: data.total }));
-        setProgress(data.done / data.total);
+        setProgress(data.at);
       }
       break;
     case 'download': {
@@ -268,10 +311,16 @@ function onWorkerMessage({ data }) {
       els.text.readOnly = false;
       setProgress(1);
       const secs = (performance.now() - run.started) / 1000;
+      const speed = (run.seconds / secs).toFixed(1);
+      // Nothing to copy or download, so it shows like a failed run: the message and New file.
+      if (!data.text) {
+        setState('error', t('noSpeech'));
+        ping('empty', { m: run.model, d: data.device, len: bucket(run.seconds / 60), x: speed });
+        break;
+      }
       const lang = data.language ? t('lang', { name: LANG_NAMES.of(data.language) || data.language }) : '';
       setState('done', t('done', { secs: Math.round(secs), lang }));
       els.cta.hidden = false;
-      const speed = (run.seconds / secs).toFixed(1);
       track('whisper_web_done', { model: run.model, device: data.device, minutes: bucket(run.seconds / 60), speed });
       ping('done', { m: run.model, d: data.device, len: bucket(run.seconds / 60), x: speed });
       break;
@@ -332,6 +381,10 @@ function download(format) {
 }
 
 function reset() {
+  if (els.result.dataset.state === 'working') {
+    worker?.terminate();
+    worker = null;
+  }
   run = null;
   els.file.value = '';
   els.text.value = '';
@@ -355,11 +408,8 @@ els.copy.addEventListener('click', async () => {
 });
 document.querySelectorAll('[data-wo-download]').forEach((b) => b.addEventListener('click', () => download(b.dataset.woDownload)));
 els.again.addEventListener('click', reset);
-els.cancel.addEventListener('click', () => {
-  worker?.terminate();
-  worker = null;
-  reset();
-});
+els.cancel.addEventListener('click', reset);
 els.cta.querySelectorAll('a').forEach((a) => a.addEventListener('click', () => track('whisper_web_cta', { target: a.dataset.cta })));
+
 
 detectGPU();

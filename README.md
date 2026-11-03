@@ -13,9 +13,9 @@ Live version: https://starwhisper.ai/whisper-web.html
 
 ## How it works
 
-1. `src/app.js` decodes the file to 16 kHz mono. Files up to 1 GB on a computer and 200 MB on a phone go through `decodeAudioData`. Larger files are read in pieces with [Mediabunny](https://github.com/Vanilagy/mediabunny) and WebCodecs, so a video of several GB works in Chrome and Edge. Without WebCodecs those limits stay.
+1. `src/app.js` decodes the file to 16 kHz mono. Files up to 50 MB go through `decodeAudioData`. Larger files are read in pieces with [Mediabunny](https://github.com/Vanilagy/mediabunny) and WebCodecs, so memory follows the length of the audio and not the size of the file, and `decodeAudioData` is the fallback up to 1 GB on a computer and 200 MB on a phone. FLAC is only ever decoded whole, because a damaged FLAC can hang the piece reader.
 2. The samples are transferred to `src/worker.js`, a module worker that loads transformers.js from jsDelivr and the ONNX model from the Hugging Face hub. The browser caches both after the first run.
-3. Long recordings are cut at the quietest moment between 20 and 29 seconds, with no overlap. If Whisper stops before the end of a piece, the next piece starts from the last timestamp it reached. Overlapping 30 second windows wrote sentences twice where they met: on an 8 minute LibriVox clip with Base on WebGPU, this change took word error from 8.08% to 5.15% and repeated 6 word runs from 22 to 0, scored with a plain lowercase comparison.
+3. Long recordings are cut at the quietest moment between 20 and 29 seconds, with no overlap. If Whisper stops before the end of a piece, the next piece starts from the last moment it reached, once in a row at most. Digital silence is skipped, and a piece where Whisper gets stuck repeating itself is decoded again with `no_repeat_ngram_size`. Overlapping 30 second windows wrote sentences twice where they met: on an 8 minute LibriVox clip with Base on WebGPU, cutting at pauses took word error from 8.08% to 5.15% and repeated 6 word runs from 22 to 0, scored with a plain lowercase comparison.
 4. With "Detect automatically", the worker runs one decoder step on the first 30 seconds and picks the most likely language token, which is how Whisper itself detects language.
 
 Model downloads (onnx-community conversions):
@@ -51,7 +51,7 @@ The only network requests are the page itself, transformers.js and the ONNX runt
 
 ## Limits
 
-- Browsers without WebCodecs stop at 1 GB on a computer and 200 MB on a phone. Extract the audio first.
+- Browsers without WebCodecs stop at 1 GB on a computer and 200 MB on a phone, and FLAC stops there in every browser. Extract the audio first.
 - A file only opens if the browser has a decoder for its audio codec.
 - Speed depends on the visitor's hardware. On a processor without WebGPU, a long recording can take longer than the recording itself.
 - No speaker labels.

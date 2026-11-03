@@ -17,6 +17,7 @@ const MAX_PIECE_S = 29;
 const PAUSE_S = 0.3;
 const STOPPED_EARLY_S = 1.5;
 const PREFER_MIN = 0.05; // English speech scored the page language at 2.2% at most, noise and tones up to 15%.
+const SILENT_PEAK = 1e-4; // 3 steps of 16-bit audio. Whisper writes "you" on digital silence, 150 times in 5 minutes.
 
 let current = { key: null, asr: null, device: null };
 const post = (msg) => self.postMessage(msg);
@@ -105,6 +106,21 @@ function nextCut(audio, start) {
   return cut;
 }
 
+function peakOf(piece) {
+  let peak = 0;
+  for (let i = 0; i < piece.length; i += 16) peak = Math.max(peak, Math.abs(piece[i]));
+  return peak;
+}
+
+// A piece where the same few characters keep coming back: Whisper is stuck, as in "4. 4. 4.", and the speech under it is lost.
+function looped(text) {
+  const s = text.replace(/\s+/g, '');
+  if (s.length < 40) return false;
+  const seen = new Set();
+  for (let i = 0; i + 4 <= s.length; i++) seen.add(s.slice(i, i + 4));
+  return seen.size / (s.length - 3) < 0.3;
+}
+
 async function transcribe({ audio, model, language, prefer, task, device: want }) {
   post({ type: 'stage', stage: 'loading' });
   const { asr, device } = await load(model, want);
@@ -118,33 +134,51 @@ async function transcribe({ audio, model, language, prefer, task, device: want }
   }
 
   const piecesLeft = (from) => Math.ceil((audio.length - from) / (SAMPLE_RATE * MAX_PIECE_S));
-  let raw = '';
-  const chunks = [];
-  let from = 0, done = 0;
-  post({ type: 'stage', stage: 'transcribing', done, total: piecesLeft(0) });
-  while (from < audio.length) {
-    const to = nextCut(audio, from);
-    const offset = from / SAMPLE_RATE;
-    const streamer = new WhisperTextStreamer(asr.tokenizer, {
+  const decodePiece = (piece, extra) => asr(piece, {
+    language: lang, task, return_timestamps: true, ...extra,
+    streamer: new WhisperTextStreamer(asr.tokenizer, {
       skip_prompt: true,
       callback_function: (text) => post({ type: 'partial', text }),
-    });
-    const out = await asr(audio.subarray(from, to), { language: lang, task, return_timestamps: true, streamer });
+    }),
+  });
+  let raw = '';
+  const chunks = [];
+  let from = 0, done = 0, decoded = 0, resumed = false;
+  const progress = () => post({ type: 'stage', stage: 'transcribing', done, total: done + piecesLeft(from), at: from / audio.length });
+  progress();
+  while (from < audio.length) {
+    const to = nextCut(audio, from);
+    const piece = audio.subarray(from, to);
+    if (peakOf(piece) < SILENT_PEAK) {
+      from = to;
+      resumed = false;
+      done += 1;
+      progress();
+      continue;
+    }
+    const offset = from / SAMPLE_RATE, length = (to - from) / SAMPLE_RATE;
+    let out = await decodePiece(piece);
+    if (looped(out.text)) out = await decodePiece(piece, { no_repeat_ngram_size: 3 });
+    decoded += 1;
     raw += out.text;
     let heard = 0;
     for (const c of out.chunks || []) {
-      heard = c.timestamp[1] ?? (to - from) / SAMPLE_RATE;
-      chunks.push({ text: c.text, timestamp: [offset + (c.timestamp[0] ?? 0), offset + heard] });
+      // Whisper counts up to 30 s even in a shorter piece, so a cue can end past the piece and overlap the next one.
+      heard = Math.min(c.timestamp[1] ?? length, length);
+      chunks.push({ text: c.text, timestamp: [offset + Math.min(c.timestamp[0] ?? 0, heard), offset + heard] });
     }
     // Whisper can stop decoding before the piece ends. Carry on from the last moment it reached, or the rest is lost.
+    // Only once in a row: on music it stops early every time, and 5 minutes became 150 pieces.
     const reached = from + Math.round(heard * SAMPLE_RATE);
-    from = heard > STOPPED_EARLY_S && to - reached > SAMPLE_RATE * STOPPED_EARLY_S ? reached : to;
+    const resume = !resumed && heard > STOPPED_EARLY_S && to - reached > SAMPLE_RATE * STOPPED_EARLY_S;
+    from = resume ? reached : to;
+    resumed = resume;
     done += 1;
-    post({ type: 'stage', stage: 'transcribing', done, total: done + piecesLeft(from) });
+    progress();
   }
   const text = raw.trim();
   // A GPU driver can return nothing where the CPU path works; try once more on WebAssembly.
-  if (!text && device === 'webgpu' && want !== 'webgpu') {
+  if (!text && decoded && device === 'webgpu' && want !== 'webgpu') {
     post({ type: 'notice', message: 'gpu-fallback' });
     return transcribe({ audio, model, language: lang, task, device: 'wasm' });
   }
