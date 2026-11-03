@@ -8,11 +8,41 @@ const els = {
   copy: $('wo-copy'), again: $('wo-again'), cancel: $('wo-cancel'), cta: $('wo-cta'),
 };
 
+// Messages, English by default. A localized page sets window.WO_STRINGS before this module runs.
+const S = {
+  gpu: 'Your browser supports WebGPU, so Whisper will run on your graphics card.',
+  cpu: 'No WebGPU here, so Whisper will run on your processor. It works, just slower. Chrome or Edge on a recent computer is fastest.',
+  engineFail: 'The transcription engine failed to start.',
+  tooBig: 'This file is {mb} MB, more than a browser tab can safely load. Save just the audio as MP3 first, or split the recording.',
+  tooBigPhone: 'This file is {mb} MB, more than a browser tab can safely load on a phone. Save just the audio as MP3 first, or split the recording.',
+  reading: 'Reading the audio from your file...',
+  decodeFail: 'Your browser could not read the audio in this file. Try MP3, WAV, M4A or MP4, or convert it first.',
+  codecFail: "This file uses an audio format ({codec}) your browser can't decode. Convert it to MP3 or WAV first.",
+  noAudio: 'This file has no audio track we could read.',
+  longCpu: 'This recording is {min} minutes long and your browser is using the processor, so it will take a while. Keep this tab open.',
+  loading: 'Loading Whisper...',
+  detecting: 'Detecting the language...',
+  part: 'Transcribing, part {n} of {total}...',
+  download: 'Downloading the model, {loaded} of about {total} MB. This happens once.',
+  done: 'Done in {secs} seconds.{lang} You can edit the text below before you copy or download it.',
+  lang: ' Language: {name}.',
+  downloadFail: "Couldn't download the Whisper model from Hugging Face. Check your connection. Some company and school networks block huggingface.co.",
+  memoryFail: 'Your browser ran out of memory. Try the Tiny model, close other tabs, or split the recording into shorter parts.',
+  transcribeFail: 'Something went wrong while transcribing ({msg}). Try the Tiny model or a shorter file.',
+  copied: 'Copied',
+  copy: 'Copy text',
+  ...window.WO_STRINGS,
+};
+const t = (key, vars = {}) => S[key].replace(/\{(\w+)\}/g, (_, k) => vars[k]);
+
 const SIZES = { wasm: { tiny: 41, base: 77, small: 249 }, webgpu: { tiny: 120, base: 206, small: 586 } };
-const LANG_NAMES = new Intl.DisplayNames(['en'], { type: 'language' });
+const LANG_NAMES = new Intl.DisplayNames([document.documentElement.lang || 'en'], { type: 'language' });
 const FORCED = new URLSearchParams(location.search).get('device'); // 'wasm' or 'webgpu', for testing
 const MOBILE = navigator.userAgentData?.mobile ?? /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-const MAX_BYTES = MOBILE ? 200e6 : 1e9; // the whole file is read into memory before decoding
+const MAX_BYTES = MOBILE ? 200e6 : 1e9; // above this, reading the whole file into memory is not safe
+const STREAM_LIB = 'https://cdn.jsdelivr.net/npm/mediabunny@1.61.6/+esm'; // needs WebCodecs, loaded only when decodeStreaming runs
+const CAN_STREAM = typeof AudioDecoder !== 'undefined';
+const PREFER = window.WO_STRINGS ? document.documentElement.lang.slice(0, 2) : null;
 let worker = null;
 let gpu = false;
 let run = null; // { name, seconds, started, chunks, text, language, device }
@@ -38,9 +68,7 @@ function updateSizes() {
   for (const opt of els.model.options) {
     opt.textContent = `${opt.dataset.label} (${sizes[opt.value]} MB)`;
   }
-  els.device.textContent = gpu
-    ? 'Your browser supports WebGPU, so Whisper will run on your graphics card.'
-    : 'No WebGPU here, so Whisper will run on your processor. It works, just slower. Chrome or Edge on a recent computer is fastest.';
+  els.device.textContent = t(gpu ? 'gpu' : 'cpu');
 }
 
 async function detectGPU() {
@@ -51,9 +79,9 @@ async function detectGPU() {
 
 function getWorker() {
   if (!worker) {
-    worker = new Worker(new URL('./worker.js?v=4', import.meta.url), { type: 'module' });
+    worker = new Worker(new URL('./worker.js?v=6', import.meta.url), { type: 'module' });
     worker.onmessage = onWorkerMessage;
-    worker.onerror = (e) => fail('engine', e.message || 'The transcription engine failed to start.');
+    worker.onerror = (e) => fail('engine', e.message || t('engineFail'));
   }
   return worker;
 }
@@ -92,34 +120,110 @@ function resample(input, rate) {
   return out;
 }
 
+// One block of mono samples to 16 kHz, with the browser's own resampler.
+async function blockTo16k(block, rate) {
+  if (rate === 16000) return block;
+  const ctx = new OfflineAudioContext(1, Math.round(block.length * 16000 / rate), 16000);
+  const buffer = ctx.createBuffer(1, block.length, rate);
+  buffer.copyToChannel(block, 0);
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  source.start();
+  return (await ctx.startRendering()).getChannelData(0);
+}
+
+// For files too big to read into memory or that decodeAudioData refuses: reads only the audio track,
+// piece by piece, with WebCodecs. The file stays on this device. Returns null if the run was cancelled.
+async function decodeStreaming(file, isCurrent) {
+  const { Input, BlobSource, ALL_FORMATS, AudioSampleSink } = await import(STREAM_LIB);
+  const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+  const track = await input.getPrimaryAudioTrack();
+  if (!track) throw Object.assign(new Error('no audio track'), { messageKey: 'noAudio' });
+  if (!(await track.canDecode())) throw Object.assign(new Error('codec'), { messageKey: 'codecFail', codec: track.codec || '?' });
+  const duration = await track.computeDuration();
+  let out = new Float32Array(Math.ceil(duration * 16000) + 16000); // a RangeError here means not enough memory
+  let written = 0;
+  let block = null; // 30 s of mono samples at the decoded rate
+  let filled = 0;
+  let rate = 0;
+  const flush = async () => {
+    if (!filled) return;
+    const part = await blockTo16k(block.subarray(0, filled), rate);
+    if (written + part.length > out.length) { const grown = new Float32Array(written + part.length + 16000 * 60); grown.set(out.subarray(0, written)); out = grown; }
+    out.set(part, written);
+    written += part.length;
+    filled = 0;
+  };
+  for await (const sample of new AudioSampleSink(track).samples()) {
+    if (!isCurrent()) { sample.close(); return null; }
+    if (!block) { rate = sample.sampleRate; block = new Float32Array(rate * 30); }
+    const frames = sample.numberOfFrames, channels = sample.numberOfChannels;
+    const mono = new Float32Array(frames);
+    const plane = new Float32Array(frames);
+    for (let c = 0; c < channels; c++) {
+      sample.copyTo(plane, { planeIndex: c, format: 'f32-planar' });
+      for (let i = 0; i < frames; i++) mono[i] += plane[i] / channels;
+    }
+    const seconds = sample.timestamp;
+    sample.close();
+    for (let at = 0; at < frames;) {
+      const take = Math.min(frames - at, block.length - filled);
+      block.set(mono.subarray(at, at + take), filled);
+      filled += take;
+      at += take;
+      if (filled === block.length) await flush();
+    }
+    if (duration) setProgress(seconds / duration);
+  }
+  await flush();
+  return out.subarray(0, written);
+}
+
 async function start(file) {
   if (!file || els.result.dataset.state === 'working') return;
-  run = { name: file.name.replace(/\.[^.]+$/, '') || 'transcript', started: performance.now(), text: '' };
+  const current = { name: file.name.replace(/\.[^.]+$/, '') || 'transcript', started: performance.now(), text: '' };
+  const isCurrent = () => run === current;
+  run = current;
   els.text.value = '';
   els.text.readOnly = true;
   els.cta.hidden = true;
   setProgress(0);
-  if (file.size > MAX_BYTES) {
-    return fail('size', `This file is ${Math.round(file.size / 1e6)} MB, more than a browser tab can safely load${MOBILE ? ' on a phone' : ''}. Save just the audio as MP3 first, or split the recording.`);
+  const big = file.size > MAX_BYTES;
+  if (big && !CAN_STREAM) {
+    return fail('size', t(MOBILE ? 'tooBigPhone' : 'tooBig', { mb: Math.round(file.size / 1e6) }));
   }
-  setState('working', 'Reading the audio from your file...');
+  setState('working', t('reading'));
   let audio;
   try {
-    audio = await decode(file);
+    if (big) {
+      audio = await decodeStreaming(file, isCurrent);
+    } else {
+      try {
+        audio = await decode(file);
+      } catch (e) {
+        if (!CAN_STREAM) throw e;
+        audio = await decodeStreaming(file, isCurrent);
+      }
+    }
   } catch (e) {
-    return fail('decode', 'Your browser could not read the audio in this file. Try MP3, WAV, M4A or MP4, or convert it first.');
+    if (!isCurrent()) return;
+    if (e instanceof RangeError) return fail('memory', t('memoryFail'));
+    return fail('decode', e.messageKey ? t(e.messageKey, { codec: e.codec }) : t('decodeFail'));
   }
-  if (!audio.length) return fail('decode', 'This file has no audio track we could read.');
+  if (!isCurrent() || !audio) return;
+  setProgress(0);
+  if (!audio.length) return fail('decode', t('noAudio'));
   run.seconds = audio.length / 16000;
   const model = els.model.value;
   run.model = model;
   track('whisper_web_start', { model, device: gpu ? 'webgpu' : 'wasm', minutes: bucket(run.seconds / 60) });
   getWorker().postMessage({
     type: 'transcribe', audio, model, device: FORCED || (gpu ? 'auto' : 'wasm'),
-    language: els.language.value, task: els.translate.checked ? 'translate' : 'transcribe',
+    language: els.language.value, prefer: PREFER, task: els.translate.checked ? 'translate' : 'transcribe',
   }, [audio.buffer]);
   if (!gpu && run.seconds > 1800) {
-    els.device.textContent = `This recording is ${Math.round(run.seconds / 60)} minutes long and your browser is using the processor, so it will take a while. Keep this tab open.`;
+    els.device.textContent = t('longCpu', { min: Math.round(run.seconds / 60) });
   }
 }
 
@@ -127,17 +231,17 @@ function onWorkerMessage({ data }) {
   if (!run) return;
   switch (data.type) {
     case 'stage':
-      if (data.stage === 'loading') setState('working', 'Loading Whisper...');
-      if (data.stage === 'detecting') setState('working', 'Detecting the language...');
+      if (data.stage === 'loading') setState('working', t('loading'));
+      if (data.stage === 'detecting') setState('working', t('detecting'));
       if (data.stage === 'transcribing') {
-        setState('working', `Transcribing, part ${Math.min(data.done + 1, data.total)} of ${data.total}...`);
+        setState('working', t('part', { n: Math.min(data.done + 1, data.total), total: data.total }));
         setProgress(data.done / data.total);
       }
       break;
     case 'download': {
       // Files report their size only when they start, so the expected size keeps the total steady.
       const total = Math.max(data.total, SIZES[gpu ? 'webgpu' : 'wasm'][run.model] * 1e6);
-      setState('working', `Downloading the model, ${Math.round(data.loaded / 1e6)} of about ${Math.round(total / 1e6)} MB. This happens once.`);
+      setState('working', t('download', { loaded: Math.round(data.loaded / 1e6), total: Math.round(total / 1e6) }));
       setProgress(data.loaded / total);
       break;
     }
@@ -164,8 +268,8 @@ function onWorkerMessage({ data }) {
       els.text.readOnly = false;
       setProgress(1);
       const secs = (performance.now() - run.started) / 1000;
-      const lang = data.language ? ` Language: ${LANG_NAMES.of(data.language) || data.language}.` : '';
-      setState('done', `Done in ${Math.round(secs)} seconds.${lang} You can edit the text below before you copy or download it.`);
+      const lang = data.language ? t('lang', { name: LANG_NAMES.of(data.language) || data.language }) : '';
+      setState('done', t('done', { secs: Math.round(secs), lang }));
       els.cta.hidden = false;
       const speed = (run.seconds / secs).toFixed(1);
       track('whisper_web_done', { model: run.model, device: data.device, minutes: bucket(run.seconds / 60), speed });
@@ -174,11 +278,11 @@ function onWorkerMessage({ data }) {
     }
     case 'error':
       if (/fetch|network|locate file|load model|404|403/i.test(data.message)) {
-        fail('download', "Couldn't download the Whisper model from Hugging Face. Check your connection. Some company and school networks block huggingface.co.");
+        fail('download', t('downloadFail'));
       } else if (/memory|allocation|out of/i.test(data.message)) {
-        fail('memory', 'Your browser ran out of memory. Try the Tiny model, close other tabs, or split the recording into shorter parts.');
+        fail('memory', t('memoryFail'));
       } else {
-        fail('transcribe', `Something went wrong while transcribing (${data.message}). Try the Tiny model or a shorter file.`);
+        fail('transcribe', t('transcribeFail', { msg: data.message }));
       }
       break;
   }
@@ -246,8 +350,8 @@ els.drop.addEventListener('drop', (e) => {
 });
 els.stamps.addEventListener('change', render);
 els.copy.addEventListener('click', async () => {
-  try { await navigator.clipboard.writeText(els.text.value); els.copy.textContent = 'Copied'; } catch (e) { els.text.select(); }
-  setTimeout(() => { els.copy.textContent = 'Copy text'; }, 1500);
+  try { await navigator.clipboard.writeText(els.text.value); els.copy.textContent = t('copied'); } catch (e) { els.text.select(); }
+  setTimeout(() => { els.copy.textContent = t('copy'); }, 1500);
 });
 document.querySelectorAll('[data-wo-download]').forEach((b) => b.addEventListener('click', () => download(b.dataset.woDownload)));
 els.again.addEventListener('click', reset);

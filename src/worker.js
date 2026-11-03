@@ -12,7 +12,11 @@ const MODELS = {
 };
 const SAMPLE_RATE = 16000;
 const CHUNK_S = 30;
-const STRIDE_S = 5;
+const MIN_PIECE_S = 20;
+const MAX_PIECE_S = 29;
+const PAUSE_S = 0.3;
+const STOPPED_EARLY_S = 1.5;
+const PREFER_MIN = 0.05; // English speech scored the page language at 2.2% at most, noise and tones up to 15%.
 
 let current = { key: null, asr: null, device: null };
 const post = (msg) => self.postMessage(msg);
@@ -65,7 +69,7 @@ async function load(model, want) {
 
 // Whisper's own language detection: one decoder step after <|startoftranscript|>,
 // then the most likely language token. Uses the first 30 seconds.
-async function detectLanguage(asr, audio) {
+async function detectLanguage(asr, audio, prefer) {
   const { input_features } = await asr.processor(audio.subarray(0, SAMPLE_RATE * CHUNK_S));
   const cfg = asr.model.generation_config;
   const sot = cfg.decoder_start_token_id;
@@ -77,10 +81,31 @@ async function detectLanguage(asr, audio) {
   for (const [token, id] of Object.entries(cfg.lang_to_id)) {
     if (row[id] > bestScore) { bestScore = row[id]; best = token.slice(2, -2); }
   }
+  // A localized page's own language wins a close call, such as Portuguese against Spanish.
+  const preferred = cfg.lang_to_id[`<|${prefer}|>`];
+  if (preferred !== undefined) {
+    let total = 0;
+    for (const id of Object.values(cfg.lang_to_id)) total += Math.exp(row[id] - bestScore);
+    if (Math.exp(row[preferred] - bestScore) / total >= PREFER_MIN) return prefer;
+  }
   return best;
 }
 
-async function transcribe({ audio, model, language, task, device: want }) {
+// Whisper hears 30 s at a time. Overlapping 30 s windows repeat or lose sentences where they meet, so a piece ends
+// at the quietest moment between 20 and 29 s from its start, and the next piece starts there, with no overlap.
+function nextCut(audio, start) {
+  const from = start + SAMPLE_RATE * MIN_PIECE_S, to = start + SAMPLE_RATE * MAX_PIECE_S, win = Math.round(SAMPLE_RATE * PAUSE_S);
+  if (audio.length <= to) return audio.length;
+  let cut = to, quietest = Infinity, energy = 0;
+  for (let i = from; i < to; i++) {
+    energy += audio[i] * audio[i];
+    if (i - from >= win) energy -= audio[i - win] * audio[i - win];
+    if (i - from >= win - 1 && energy < quietest) { quietest = energy; cut = i - (win >> 1); }
+  }
+  return cut;
+}
+
+async function transcribe({ audio, model, language, prefer, task, device: want }) {
   post({ type: 'stage', stage: 'loading' });
   const { asr, device } = await load(model, want);
   post({ type: 'ready', device, isolated: self.crossOriginIsolated === true });
@@ -88,36 +113,42 @@ async function transcribe({ audio, model, language, task, device: want }) {
   let lang = language;
   if (lang === 'auto') {
     post({ type: 'stage', stage: 'detecting' });
-    lang = await detectLanguage(asr, audio);
+    lang = await detectLanguage(asr, audio, prefer);
     post({ type: 'language', language: lang });
   }
 
-  const windowLen = SAMPLE_RATE * CHUNK_S;
-  const jump = SAMPLE_RATE * (CHUNK_S - 2 * STRIDE_S);
-  const total = audio.length <= windowLen ? 1 : 1 + Math.ceil((audio.length - windowLen) / jump);
-  let done = 0;
-  post({ type: 'stage', stage: 'transcribing', done, total });
-  const streamer = new WhisperTextStreamer(asr.tokenizer, {
-    skip_prompt: true,
-    callback_function: (text) => post({ type: 'partial', text }),
-    on_finalize: () => { done += 1; post({ type: 'stage', stage: 'transcribing', done: Math.min(done, total), total }); },
-  });
-
-  const out = await asr(audio, {
-    language: lang,
-    task,
-    chunk_length_s: CHUNK_S,
-    stride_length_s: STRIDE_S,
-    return_timestamps: true,
-    streamer,
-  });
-  const text = out.text.trim();
+  const piecesLeft = (from) => Math.ceil((audio.length - from) / (SAMPLE_RATE * MAX_PIECE_S));
+  let raw = '';
+  const chunks = [];
+  let from = 0, done = 0;
+  post({ type: 'stage', stage: 'transcribing', done, total: piecesLeft(0) });
+  while (from < audio.length) {
+    const to = nextCut(audio, from);
+    const offset = from / SAMPLE_RATE;
+    const streamer = new WhisperTextStreamer(asr.tokenizer, {
+      skip_prompt: true,
+      callback_function: (text) => post({ type: 'partial', text }),
+    });
+    const out = await asr(audio.subarray(from, to), { language: lang, task, return_timestamps: true, streamer });
+    raw += out.text;
+    let heard = 0;
+    for (const c of out.chunks || []) {
+      heard = c.timestamp[1] ?? (to - from) / SAMPLE_RATE;
+      chunks.push({ text: c.text, timestamp: [offset + (c.timestamp[0] ?? 0), offset + heard] });
+    }
+    // Whisper can stop decoding before the piece ends. Carry on from the last moment it reached, or the rest is lost.
+    const reached = from + Math.round(heard * SAMPLE_RATE);
+    from = heard > STOPPED_EARLY_S && to - reached > SAMPLE_RATE * STOPPED_EARLY_S ? reached : to;
+    done += 1;
+    post({ type: 'stage', stage: 'transcribing', done, total: done + piecesLeft(from) });
+  }
+  const text = raw.trim();
   // A GPU driver can return nothing where the CPU path works; try once more on WebAssembly.
   if (!text && device === 'webgpu' && want !== 'webgpu') {
     post({ type: 'notice', message: 'gpu-fallback' });
     return transcribe({ audio, model, language: lang, task, device: 'wasm' });
   }
-  post({ type: 'done', text, chunks: out.chunks || [], language: lang, device });
+  post({ type: 'done', text, chunks, language: lang, device });
 }
 
 self.onmessage = async ({ data }) => {

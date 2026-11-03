@@ -13,6 +13,11 @@ ONNX Runtime Web (onnxruntime-web), from cdn.jsdelivr.net
   Licensed under the MIT License
   https://github.com/microsoft/onnxruntime
 
+Mediabunny, from cdn.jsdelivr.net, loaded only for large files
+  Copyright Vanilagy
+  Licensed under the Mozilla Public License 2.0
+  https://github.com/Vanilagy/mediabunny
+
 OpenAI Whisper model weights (tiny, base, small), in the ONNX conversions
 published by onnx-community on the Hugging Face hub
   Copyright (c) 2022 OpenAI

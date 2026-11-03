@@ -75,6 +75,8 @@
 .wo-table th, .wo-table td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border-color); vertical-align: top; }
 .wo-table th { color: var(--text-primary); font-weight: 600; }
 .wo-table td { color: var(--text-secondary); }
+.wo-table th:first-child, .wo-table td:first-child { white-space: nowrap; }
+html[lang="ja"] .wo-hero h1, html[lang="ja"] .wo-content h2, html[lang="ja"] .wo-drop strong, html[lang="ja"] .wo-drop span { word-break: auto-phrase; }
 .wo-scroll { overflow-x: auto; }
 
 @media (max-width: 640px) {

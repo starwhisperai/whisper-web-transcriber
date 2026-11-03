@@ -8,13 +8,14 @@ Live version: https://starwhisper.ai/whisper-web.html
 - Uses WebGPU when the browser has it, WebAssembly otherwise
 - Detects the spoken language, or you pick it; can translate into English
 - Exports plain text, SRT and VTT
+- Reads MP3, WAV, M4A, OGG, Opus, FLAC and WEBM audio, plus the audio track of MP4, MOV, MKV and WEBM video
 - No build step, no server code, no dependencies to install
 
 ## How it works
 
-1. `src/app.js` reads the file with `File.arrayBuffer()` and decodes it with an `OfflineAudioContext` at 16 kHz, mixed down to mono.
+1. `src/app.js` decodes the file to 16 kHz mono. Files up to 1 GB on a computer and 200 MB on a phone go through `decodeAudioData`. Larger files are read in pieces with [Mediabunny](https://github.com/Vanilagy/mediabunny) and WebCodecs, so a video of several GB works in Chrome and Edge. Without WebCodecs those limits stay.
 2. The samples are transferred to `src/worker.js`, a module worker that loads transformers.js from jsDelivr and the ONNX model from the Hugging Face hub. The browser caches both after the first run.
-3. Long recordings are cut into 30 second windows with 5 seconds of overlap on each side, and transformers.js merges the overlapping text.
+3. Long recordings are cut at the quietest moment between 20 and 29 seconds, with no overlap. If Whisper stops before the end of a piece, the next piece starts from the last timestamp it reached. Overlapping 30 second windows wrote sentences twice where they met: on an 8 minute LibriVox clip with Base on WebGPU, this change took word error from 8.08% to 5.15% and repeated 6 word runs from 22 to 0, scored with a plain lowercase comparison.
 4. With "Detect automatically", the worker runs one decoder step on the first 30 seconds and picks the most likely language token, which is how Whisper itself detects language.
 
 Model downloads (onnx-community conversions):
@@ -46,11 +47,12 @@ Add `?device=wasm` or `?device=webgpu` to the URL to force a backend.
 
 ## Privacy
 
-The only network requests are the page itself, transformers.js and the ONNX runtime from jsDelivr, and the model files from huggingface.co and its download CDN. Open the Network tab in your browser's developer tools while you transcribe and you can check that no audio leaves the page.
+The only network requests are the page itself, transformers.js and the ONNX runtime from jsDelivr, Mediabunny from jsDelivr when a large file needs it, and the model files from huggingface.co and its download CDN. Open the Network tab in your browser's developer tools while you transcribe and you can check that no audio leaves the page.
 
 ## Limits
 
-- The whole file is read into memory before decoding, so very large video files can fail. Extract the audio first.
+- Browsers without WebCodecs stop at 1 GB on a computer and 200 MB on a phone. Extract the audio first.
+- A file only opens if the browser has a decoder for its audio codec.
 - Speed depends on the visitor's hardware. On a processor without WebGPU, a long recording can take longer than the recording itself.
 - No speaker labels.
 
