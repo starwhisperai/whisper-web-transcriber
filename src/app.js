@@ -33,6 +33,7 @@ const S = {
   transcribeFail: 'Something went wrong while transcribing ({msg}). Try the Tiny model or a shorter file.',
   copied: 'Copied',
   copy: 'Copy text',
+  sizeUnit: 'MB',
   ...window.WO_STRINGS,
 };
 const t = (key, vars = {}) => S[key].replace(/\{(\w+)\}/g, (_, k) => vars[k]);
@@ -74,7 +75,7 @@ function setProgress(fraction) {
 function updateSizes() {
   const sizes = SIZES[gpu ? 'webgpu' : 'wasm'];
   for (const opt of els.model.options) {
-    opt.textContent = `${opt.dataset.label} (${sizes[opt.value]} MB)`;
+    opt.textContent = `${opt.dataset.label} (${sizes[opt.value]} ${S.sizeUnit})`;
   }
   els.device.textContent = t(gpu ? 'gpu' : 'cpu');
 }
